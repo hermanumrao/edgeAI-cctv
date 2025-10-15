@@ -9,6 +9,8 @@
 #include <mutex>
 #include <condition_variable>
 #include <unistd.h>
+#include <opencv2/opencv.hpp>
+#include <opencv2/dnn.hpp>
 
 MjpegHub::MjpegHub()
     : width_(cfg::CAM_WIDTH), height_(cfg::CAM_HEIGHT), fps_(cfg::CAM_FPS) {
@@ -167,15 +169,20 @@ void MjpegHub::reader_thread_fn() {
 }
 
 void MjpegHub::motion_thread_fn() {
-    // Motion detector operates on JPEG frames decoded internally
+    // Motion detector
     MotionDetector detector(width_, height_, /*thresh*/25.0, /*minChange*/0.02);
+
+    // Load YOLO model once
+    cv::dnn::Net net = cv::dnn::readNetFromONNX("model.onnx");
+    net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+    net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU); // use GPU later if available
 
     while (true) {
         std::vector<unsigned char> jpeg;
 
         {
             std::unique_lock<std::mutex> lk(motion_mtx_);
-            motion_cv_.wait(lk, [&]{
+            motion_cv_.wait(lk, [&] {
                 return !motion_running_ || !motion_queue_.empty();
             });
 
@@ -186,11 +193,50 @@ void MjpegHub::motion_thread_fn() {
             motion_queue_.pop();
         }
 
-        // Detect
+        // Detect motion
         if (detector.detect(jpeg)) {
             printf("Motion detected at %s\n", now_timestamp().c_str());
             fflush(stdout);
+
+            // --- Decode JPEG to Mat
+            cv::Mat raw = cv::imdecode(jpeg, cv::IMREAD_COLOR);
+            if (raw.empty()) continue;
+
+            // --- YOLO inference
+            cv::Mat blob = cv::dnn::blobFromImage(raw, 1/255.0, cv::Size(640,640), cv::Scalar(), true, false);
+            net.setInput(blob);
+            std::vector<cv::Mat> outs;
+            net.forward(outs, net.getUnconnectedOutLayersNames());
+
+            // --- Parse results
+            float* data = (float*)outs[0].data;
+            int dimensions = 85; // YOLOv5: [x,y,w,h,conf,cls...]
+            int rows = outs[0].size[1];
+            for (int i = 0; i < rows; i++) {
+                float conf = data[4];
+                if (conf > 0.5) { // confidence threshold
+                    float x = data[0] * raw.cols;
+                    float y = data[1] * raw.rows;
+                    float w = data[2] * raw.cols;
+                    float h = data[3] * raw.rows;
+                    int left = (int)(x - w/2);
+                    int top = (int)(y - h/2);
+                    cv::rectangle(raw, cv::Rect(left, top, (int)w, (int)h), cv::Scalar(0,255,0), 2);
+                }
+                data += dimensions;
+            }
+
+            // --- Re-encode with boxes
+            std::vector<uchar> buf;
+            cv::imencode(".jpg", raw, buf);
+
+            // --- Send to sinks (with boxes)
+            {
+                std::lock_guard<std::mutex> lk(sinks_m_);
+                for (auto &p : sinks_) {
+                    if (p.second) p.second(buf);
+                }
+            }
         }
     }
 }
-

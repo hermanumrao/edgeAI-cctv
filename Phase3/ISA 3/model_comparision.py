@@ -1,477 +1,533 @@
 import cv2
 import numpy as np
 import time
-import matplotlib.pyplot as plt
-from sklearn.metrics import precision_score, recall_score, f1_score
 import os
-from PIL import Image
-import torch
+from pathlib import Path
+import matplotlib.pyplot as plt
+import seaborn as sns
+import matplotlib.ticker as ticker
 from collections import defaultdict
+import pandas as pd
 from ultralytics import YOLO
+import torch
 
-# Create directories if they don't exist
-os.makedirs('results', exist_ok=True)
-
-
-
-class HaarCascadeDetector:
-    def __init__(self):
-        # Load the pre-trained Haar Cascade classifier for human detection
-        self.human_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_fullbody.xml')
-        self.upper_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_upperbody.xml')
-        self.lower_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_lowerbody.xml')
-    
-    def detect(self, image):
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+class HumanDetectionComparison:
+    def __init__(self, dataset_path, yolov5_model_path):
+        self.dataset_path = Path(dataset_path)
+        self.yolov5_model_path = yolov5_model_path
+        # track which API loaded the yolov5 model ('hub' or 'ultralytics')
+        self.yolov5_model_type = None
+        self.results = defaultdict(list)
+        self.detection_results = {}
         
-        # Detect full body
-        bodies = self.human_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+        # Create output directories
+        self.output_dir = Path("detection_results")
+        self.output_dir.mkdir(exist_ok=True)
+        (self.output_dir / "visualizations").mkdir(exist_ok=True)
+        (self.output_dir / "graphs").mkdir(exist_ok=True)
         
-        # Detect upper body if full body not found
-        if len(bodies) == 0:
-            upper_bodies = self.upper_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
-            bodies = upper_bodies
+        # Load models
+        print("Loading models...")
+        self.load_models()
         
-        # Detect lower body if others not found
-        if len(bodies) == 0:
-            lower_bodies = self.lower_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
-            bodies = lower_bodies
-            
-        return bodies
-    
-    def draw_detections(self, image, detections):
-        img_copy = image.copy()
-        for (x, y, w, h) in detections:
-            cv2.rectangle(img_copy, (x, y), (x+w, y+h), (255, 0, 0), 2)
-        return img_copy
-
-
-
-class HOGDetector:
-    def __init__(self):
-        # Initialize HOG descriptor
-        self.hog = cv2.HOGDescriptor()
-        self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-    
-    def detect(self, image):
-        # Detect people in the image
-        boxes, weights = self.hog.detectMultiScale(image, winStride=(8,8), padding=(32,32), scale=1.05)
-        return boxes, weights
-    
-    def draw_detections(self, image, detections):
-        img_copy = image.copy()
-        boxes, weights = detections
-        for i, (x, y, w, h) in enumerate(boxes):
-            if weights[i] > 0.5:  # Filter by confidence
-                cv2.rectangle(img_copy, (x, y), (x+w, y+h), (0, 255, 0), 2)
-        return img_copy
-
-
-
-class YOLODetector:
-    def __init__(self):
+    def load_models(self):
+        """Load all detection models"""
+        # 1. YOLOv5 (custom model)
         try:
-            self.model = YOLO('yolov5nu.pt')  # use your local model file
-            self.model.to('cpu')
+            # Try normal load first
+            self.yolov5_model = torch.hub.load('ultralytics/yolov5', 'custom', 
+                                               path=self.yolov5_model_path, force_reload=False)
+            self.yolov5_model.conf = 0.25
+            self.yolov5_model_type = 'hub'
+            print("✓ YOLOv5 model loaded (cache)")
         except Exception as e:
-            print(f"YOLO model loading failed: {e}")
-            self.model = None
-
-    def detect(self, image):
-        if self.model is None:
-            return []
-        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        results = self.model.predict(rgb_image)
-        detections = []
-        for r in results:
-            for box in r.boxes.data.cpu().numpy():
-                x1, y1, x2, y2, conf, cls = box
-                if int(cls) == 0:  # person class
-                    detections.append([x1, y1, x2, y2, conf, cls])
-        return np.array(detections)
-    
-    def draw_detections(self, image, detections):
-        img_copy = image.copy()
-        if len(detections) > 0:
-            for det in detections:
-                x1, y1, x2, y2, conf, cls = det
-                if conf > 0.5:  # Confidence threshold
-                    cv2.rectangle(img_copy, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 2)
-                    cv2.putText(img_copy, f'Person: {conf:.2f}', (int(x1), int(y1)-10), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-        return img_copy
-
-
-
-class BackgroundSubtractorDetector:
-    def __init__(self):
-        # Initialize background subtractor
-        self.backSub = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=50, detectShadows=True)
-        self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    
-    def detect(self, image):
-        # Apply background subtraction
-        fgMask = self.backSub.apply(image)
+            # Some hub cache states cause errors like: "'Detect' object has no attribute 'grid'"
+            # Retry with force_reload to clear the hub cache.
+            print(f"⚠ YOLOv5 initial load failed: {e}")
+            try:
+                print("Retrying YOLOv5 load with force_reload=True...")
+                self.yolov5_model = torch.hub.load('ultralytics/yolov5', 'custom', 
+                                                   path=self.yolov5_model_path, force_reload=True)
+                self.yolov5_model.conf = 0.25
+                self.yolov5_model_type = 'hub'
+                print("✓ YOLOv5 model loaded (force_reload)")
+            except Exception as e2:
+                print(f"✗ YOLOv5 loading failed after retry: {e2}")
+                print("Attempting to load the local weights with the ultralytics.YOLO loader as a fallback...")
+                try:
+                    # Try to load the local .pt with the ultralytics YOLO class
+                    self.yolov5_model = YOLO(self.yolov5_model_path)
+                    self.yolov5_model_type = 'ultralytics'
+                    print("✓ YOLOv5 weights loaded via ultralytics.YOLO fallback")
+                except Exception as e3:
+                    print(f"✗ YOLOv5 loading failed after ultralytics fallback: {e3}")
+                    print("YOLOv5 will be skipped. If you keep seeing this, try clearing the torch hub cache or ensure the weights file is a valid yolov5/ultralytics .pt file.")
+                    self.yolov5_model = None
         
-        # Apply morphological operations to clean up the mask
-        fgMask = cv2.morphologyEx(fgMask, cv2.MORPH_OPEN, self.kernel)
-        fgMask = cv2.morphologyEx(fgMask, cv2.MORPH_CLOSE, self.kernel)
+        # 2. YOLOv8 (pretrained)
+        try:
+            self.yolov8_model = YOLO('yolov8n.pt')
+            print("✓ YOLOv8 model loaded")
+        except Exception as e:
+            print(f"✗ YOLOv8 loading failed: {e}")
+            self.yolov8_model = None
         
-        # Find contours
-        contours, _ = cv2.findContours(fgMask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # 3. Haar Cascade
+        try:
+            cascade_path = cv2.data.haarcascades + 'haarcascade_fullbody.xml'
+            self.haar_cascade = cv2.CascadeClassifier(cascade_path)
+            if self.haar_cascade.empty():
+                raise Exception("Failed to load Haar Cascade")
+            print("✓ Haar Cascade loaded")
+        except Exception as e:
+            print(f"✗ Haar Cascade loading failed: {e}")
+            self.haar_cascade = None
         
-        # Filter contours by area (assuming humans are large objects)
-        human_contours = []
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area > 1000:  # Minimum area threshold
-                x, y, w, h = cv2.boundingRect(contour)
-                human_contours.append((x, y, w, h))
+        # 4. HOG Detector
+        try:
+            self.hog_detector = cv2.HOGDescriptor()
+            self.hog_detector.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+            print("✓ HOG Detector loaded")
+        except Exception as e:
+            print(f"✗ HOG Detector loading failed: {e}")
+            self.hog_detector = None
         
-        return human_contours, fgMask
+        # MobileNet SSD removed — not used in this comparison
     
-    def draw_detections(self, image, detections):
-        img_copy = image.copy()
-        contours, mask = detections
-        for (x, y, w, h) in contours:
-            cv2.rectangle(img_copy, (x, y), (x+w, y+h), (255, 255, 0), 2)
-        return img_copy
-
-
-
-def measure_performance(detector, image, detector_name):
-    """Measure detection performance including time and basic metrics"""
-    start_time = time.time()
-    
-    try:
-        detections = detector.detect(image)
+    def detect_yolov5(self, image):
+        """YOLOv5 detection"""
+        if self.yolov5_model is None:
+            return [], 0
+        
+        start_time = time.time()
+        try:
+            # If model was loaded with ultralytics.YOLO the call signature is similar to YOLOv8
+            if self.yolov5_model_type == 'ultralytics':
+                results = self.yolov5_model(image, verbose=False)
+            else:
+                results = self.yolov5_model(image)
+        except Exception as e:
+            # Catch runtime inference errors and skip
+            print(f"YOLOv5 inference error: {e}")
+            return [], 0
         inference_time = time.time() - start_time
         
-        # Count detections
-        if isinstance(detections, tuple):
-            if len(detections) > 0 and len(detections[0]) > 0:
-                detection_count = len(detections[0])
-            else:
-                detection_count = 0
-        elif isinstance(detections, np.ndarray):
-            detection_count = len(detections)
-        else:
-            detection_count = len(detections) if detections is not None else 0
-            
-        return {
-            'detections': detections,
-            'inference_time': inference_time,
-            'detection_count': detection_count,
-            'success': True
-        }
-    except Exception as e:
-        print(f"Error in {detector_name}: {e}")
-        return {
-            'detections': [],
-            'inference_time': 0,
-            'detection_count': 0,
-            'success': False
-        }
+        detections = []
+        # Filter for person class (class 0 in COCO)
+    # Different versions of the yolov5 hub return results in slightly different
+    # structures. Try a few common access patterns. If the model was loaded via
+    # ultralytics.YOLO, its results behave like yolov8 outputs (iterable of result objects).
+        parsed = False
+        # Pattern 1: results.xyxy[0]
+        try:
+            arr = results.xyxy[0].cpu().numpy()
+            for *box, conf, cls in arr:
+                if int(cls) == 0:
+                    x1, y1, x2, y2 = map(int, box)
+                    detections.append({'bbox': [x1, y1, x2, y2], 'confidence': float(conf)})
+            parsed = True
+        except Exception:
+            pass
 
-def compare_detectors(image_path, detectors_dict):
-    """Compare all detectors on a single image"""
-    # Load image
-    image = cv2.imread(image_path)
-    if image is None:
-        print(f"Could not load image: {image_path}")
-        return None
-    
-    results = {}
-    
-    # Test each detector
-    for name, detector in detectors_dict.items():
-        print(f"Testing {name}...")
-        result = measure_performance(detector, image, name)
-        results[name] = result
-        
-        # Save detection visualization
-        if result['success']:
+        # Pattern 2: results.pandas().xyxy[0]
+        if not parsed:
             try:
-                visualized = detector.draw_detections(image, result['detections'])
-                cv2.imwrite(f'results/{name}_detection_{os.path.basename(image_path)}', visualized)
-            except Exception as e:
-                print(f"Could not save visualization for {name}: {e}")
-    
-    return results, image
+                df = results.pandas().xyxy[0]
+                for _, row in df.iterrows():
+                    if int(row['class']) == 0:
+                        x1, y1, x2, y2 = int(row['xmin']), int(row['ymin']), int(row['xmax']), int(row['ymax'])
+                        detections.append({'bbox': [x1, y1, x2, y2], 'confidence': float(row['confidence'])})
+                parsed = True
+            except Exception:
+                pass
 
-
-
-# Initialize all detectors
-print("Initializing detectors...")
-
-# Haar Cascade
-haar_detector = HaarCascadeDetector()
-print("Haar Cascade initialized")
-
-# HOG + SVM
-hog_detector = HOGDetector()
-print("HOG detector initialized")
-
-# YOLO (if available)
-try:
-    yolo_detector = YOLODetector()
-    print("YOLO detector initialized")
-except:
-    yolo_detector = None
-    print("YOLO detector not available")
-
-# Background Subtractor
-bg_detector = BackgroundSubtractorDetector()
-print("Background subtractor initialized")
-
-# Create detectors dictionary
-detectors = {
-    'Haar_Cascade': haar_detector,
-    'HOG_SVM': hog_detector,
-    'Background_Subtraction': bg_detector
-}
-
-if yolo_detector is not None and yolo_detector.model is not None:
-    detectors['YOLOv5'] = yolo_detector
-
-print(f"Initialized {len(detectors)} detectors")
-
-
-
-# Set your dataset path
-DATASET_PATH = "human detection dataset"
-IMAGES_PATH = os.path.join(DATASET_PATH, "images")
-
-# Check if dataset exists
-if not os.path.exists(DATASET_PATH):
-    print(f"Dataset folder '{DATASET_PATH}' not found!")
-    print("Please make sure your dataset is in the correct location.")
-else:
-    print(f"Dataset found at: {DATASET_PATH}")
-
-# Find all PNG images in the images folder
-test_image_paths = []
-if os.path.exists(IMAGES_PATH):
-    for file in os.listdir(IMAGES_PATH):
-        if file.lower().endswith('.png'):
-            test_image_paths.append(os.path.join(IMAGES_PATH, file))
-    
-    print(f"Found {len(test_image_paths)} PNG images in the dataset")
-    if len(test_image_paths) > 0:
-        print("First few images:")
-        for i, path in enumerate(test_image_paths[:5]):
-            print(f"  {i+1}. {os.path.basename(path)}")
-else:
-    print(f"Images folder '{IMAGES_PATH}' not found!")
-
-
-
-# Process a subset of images (to avoid long processing times)
-MAX_IMAGES = 20  # Adjust this number based on your needs
-selected_images = test_image_paths[:MAX_IMAGES] if len(test_image_paths) > 0 else []
-
-print(f"Processing {len(selected_images)} images from your dataset...")
-
-# Run detection on selected images
-all_results = {}
-
-for i, img_path in enumerate(selected_images):
-    print(f"\nProcessing image {i+1}/{len(selected_images)}: {os.path.basename(img_path)}")
-    results, original_image = compare_detectors(img_path, detectors)
-    
-    if results is not None:
-        all_results[img_path] = results
+        # Pattern 3: results may be a list of detections per image
+        if not parsed:
+            try:
+                # Try iterate over results if it's list-like
+                for r in results:
+                    # each r may have .boxes or .xyxy
+                    if hasattr(r, 'boxes'):
+                        for box in r.boxes:
+                            cls_val = int(box.cls[0]) if hasattr(box, 'cls') and len(box.cls) > 0 else None
+                            if cls_val == 0:
+                                xy = box.xyxy[0] if hasattr(box, 'xyxy') else None
+                                if xy is not None:
+                                    x1, y1, x2, y2 = map(int, xy)
+                                    conf = float(box.conf[0]) if hasattr(box, 'conf') and len(box.conf) > 0 else 1.0
+                                    detections.append({'bbox': [x1, y1, x2, y2], 'confidence': conf})
+                    elif hasattr(r, 'xyxy'):
+                        arr = r.xyxy.cpu().numpy()
+                        for *box, conf, cls in arr:
+                            if int(cls) == 0:
+                                x1, y1, x2, y2 = map(int, box)
+                                detections.append({'bbox': [x1, y1, x2, y2], 'confidence': float(conf)})
+                parsed = True
+            except Exception:
+                pass
+        # If model was loaded by ultralytics and parsed is still False, try the yolov8-style path
+        if not parsed and self.yolov5_model_type == 'ultralytics':
+            try:
+                for result in results:
+                    boxes = getattr(result, 'boxes', None)
+                    if boxes is None:
+                        continue
+                    for box in boxes:
+                        cls_val = int(box.cls[0]) if hasattr(box, 'cls') and len(box.cls) > 0 else None
+                        if cls_val == 0:
+                            x1, y1, x2, y2 = map(int, box.xyxy[0])
+                            conf = float(box.conf[0]) if hasattr(box, 'conf') and len(box.conf) > 0 else 1.0
+                            detections.append({'bbox': [x1, y1, x2, y2], 'confidence': conf})
+                parsed = True
+            except Exception:
+                pass
         
-        # Display progress results
-        print(f"  Detection Results:")
-        for detector_name, result in results.items():
-            print(f"    {detector_name:20} | Time: {result['inference_time']:.4f}s | Detections: {result['detection_count']}")
+        return detections, inference_time
+
+    # Ad-Hoc detector removed
+
+    
+    def detect_yolov8(self, image):
+        """YOLOv8 detection"""
+        if self.yolov8_model is None:
+            return [], 0
         
-
-
-def generate_comparison_report(all_results):
-    """Generate a comprehensive comparison report"""
+        start_time = time.time()
+        results = self.yolov8_model(image, verbose=False)
+        inference_time = time.time() - start_time
+        
+        detections = []
+        for result in results:
+            boxes = result.boxes
+            for box in boxes:
+                if int(box.cls[0]) == 0:  # person class
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    detections.append({
+                        'bbox': [x1, y1, x2, y2],
+                        'confidence': float(box.conf[0])
+                    })
+        
+        return detections, inference_time
     
-    # Aggregate results
-    performance_stats = defaultdict(list)
-    
-    for img_path, results in all_results.items():
-        for detector_name, result in results.items():
-            performance_stats[detector_name].append({
-                'time': result['inference_time'],
-                'detections': result['detection_count']
+    def detect_haar_cascade(self, image):
+        """Haar Cascade detection"""
+        if self.haar_cascade is None:
+            return [], 0
+        
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        
+        start_time = time.time()
+        bodies = self.haar_cascade.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=3, minSize=(30, 30)
+        )
+        inference_time = time.time() - start_time
+        
+        detections = []
+        for (x, y, w, h) in bodies:
+            detections.append({
+                'bbox': [x, y, x + w, y + h],
+                'confidence': 1.0  # Haar Cascade doesn't provide confidence
             })
+        
+        return detections, inference_time
     
-    # Calculate averages
-    avg_stats = {}
-    for detector_name, stats in performance_stats.items():
-        avg_time = np.mean([s['time'] for s in stats])
-        avg_detections = np.mean([s['detections'] for s in stats])
-        avg_stats[detector_name] = {
-            'avg_time': avg_time,
-            'avg_detections': avg_detections,
-            'total_tests': len(stats)
+    def detect_hog(self, image):
+        """HOG detection"""
+        if self.hog_detector is None:
+            return [], 0
+        
+        start_time = time.time()
+        boxes, weights = self.hog_detector.detectMultiScale(
+            image, winStride=(8, 8), padding=(4, 4), scale=1.05
+        )
+        inference_time = time.time() - start_time
+        
+        detections = []
+        for i, (x, y, w, h) in enumerate(boxes):
+            # Handle both scalar and array weights
+            weight = weights[i]
+            if isinstance(weight, np.ndarray):
+                confidence = float(weight[0]) if len(weight) > 0 else 1.0
+            else:
+                confidence = float(weight)
+            
+            detections.append({
+                'bbox': [x, y, x + w, y + h],
+                'confidence': confidence
+            })
+        
+        return detections, inference_time
+
+    
+    def process_dataset(self):
+        """Process all images in the dataset"""
+        image_files = list(self.dataset_path.glob("*.jpg")) + \
+                     list(self.dataset_path.glob("*.png")) + \
+                     list(self.dataset_path.glob("*.jpeg"))
+        
+        if not image_files:
+            print(f"No images found in {self.dataset_path}")
+            return
+        
+        # Limit to random 50 images
+        if len(image_files) > 50:
+            import random
+            random.seed(42)  # For reproducibility
+            image_files = random.sample(image_files, 50)
+            print(f"\nRandomly selected 50 images out of {len(list(self.dataset_path.glob('*.jpg')) + list(self.dataset_path.glob('*.png')) + list(self.dataset_path.glob('*.jpeg')))} total images")
+        
+        print(f"\nProcessing {len(image_files)} images...")
+        
+        models = {
+            'YOLOv5': self.detect_yolov5,
+            'YOLOv8': self.detect_yolov8,
+            'Haar Cascade': self.detect_haar_cascade,
+            'HOG': self.detect_hog
         }
-    
-    return avg_stats
-
-# Generate report
-if all_results:
-    report = generate_comparison_report(all_results)
-    
-    print("\n" + "="*60)
-    print("PERFORMANCE COMPARISON REPORT")
-    print("="*60)
-    print(f"{'Detector':20} | {'Avg Time (s)':12} | {'Avg Detections':15} | {'Tests':6}")
-    print("-"*60)
-    
-    for detector_name, stats in report.items():
-        print(f"{detector_name:20} | {stats['avg_time']:12.4f} | {stats['avg_detections']:15.2f} | {stats['total_tests']:6}")
-    
-    # Save report to file
-    with open('results/comparison_report.txt', 'w') as f:
-        f.write("Human Detection Performance Comparison Report\n")
-        f.write("="*60 + "\n")
-        f.write(f"Dataset: {DATASET_PATH}\n")
-        f.write(f"Images processed: {len(all_results)}\n")
-        f.write("-"*60 + "\n")
-        f.write(f"{'Detector':20} | {'Avg Time (s)':12} | {'Avg Detections':15} | {'Tests':6}\n")
-        f.write("-"*60 + "\n")
-        for detector_name, stats in report.items():
-            f.write(f"{detector_name:20} | {stats['avg_time']:12.4f} | {stats['avg_detections']:15.2f} | {stats['total_tests']:6}\n")
-    
-    print(f"\nDetailed report saved to results/comparison_report.txt")
-else:
-    print("No results to generate report from.")
-
-
-
-def plot_performance_comparison(report):
-    """Create visualizations of the performance comparison"""
-    
-    if not report:
-        print("No data to plot")
-        return
-    
-    detector_names = list(report.keys())
-    avg_times = [report[name]['avg_time'] for name in detector_names]
-    avg_detections = [report[name]['avg_detections'] for name in detector_names]
-    
-    # Create subplots
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-    
-    # Plot 1: Average Inference Time
-    bars1 = ax1.bar(detector_names, avg_times, color=['red', 'blue', 'green', 'orange'][:len(detector_names)])
-    ax1.set_title('Average Inference Time Comparison')
-    ax1.set_ylabel('Time (seconds)')
-    ax1.set_xlabel('Detectors')
-    ax1.tick_params(axis='x', rotation=45)
-    
-    # Add value labels on bars
-    for bar, time_val in zip(bars1, avg_times):
-        ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.001,
-                f'{time_val:.4f}s', ha='center', va='bottom')
-    
-    # Plot 2: Average Number of Detections
-    bars2 = ax2.bar(detector_names, avg_detections, color=['red', 'blue', 'green', 'orange'][:len(detector_names)])
-    ax2.set_title('Average Number of Detections')
-    ax2.set_ylabel('Number of Detections')
-    ax2.set_xlabel('Detectors')
-    ax2.tick_params(axis='x', rotation=45)
-    
-    # Add value labels on bars
-    for bar, det_val in zip(bars2, avg_detections):
-        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1,
-                f'{det_val:.2f}', ha='center', va='bottom')
-    
-    plt.tight_layout()
-    plt.savefig('results/performance_comparison.png', dpi=300, bbox_inches='tight')
-    plt.show()
-
-# Create performance plots
-if 'report' in locals() and report:
-    plot_performance_comparison(report)
-    print("Performance comparison plots saved to results/performance_comparison.png")
-else:
-    print("No performance data to plot")
-
-
-
-def print_recommendations(report):
-    """Print recommendations based on performance"""
-    
-    if not report:
-        return
-    
-    # Find best performers
-    fastest_detector = min(report.items(), key=lambda x: x[1]['avg_time'])
-    most_accurate_detector = max(report.items(), key=lambda x: x[1]['avg_detections'])
-    
-    print("\n" + "="*60)
-    print("RECOMMENDATIONS")
-    print("="*60)
-    print(f"Fastest Detector: {fastest_detector[0]} ({fastest_detector[1]['avg_time']:.4f}s avg)")
-    print(f"Most Detections: {most_accurate_detector[0]} ({most_accurate_detector[1]['avg_detections']:.2f} avg)")
-    
-    print("\nDetailed Analysis:")
-    
-    # Performance characteristics
-    for name, stats in report.items():
-        time_category = "Fast" if stats['avg_time'] < 0.1 else "Medium" if stats['avg_time'] < 0.5 else "Slow"
-        detection_category = "High" if stats['avg_detections'] > 2 else "Medium" if stats['avg_detections'] > 0 else "Low"
         
-        print(f"\n{name}:")
-        print(f"  - Speed: {time_category} ({stats['avg_time']:.4f}s)")
-        print(f"  - Detection Rate: {detection_category} ({stats['avg_detections']:.2f} detections)")
-        
-        # Specific recommendations
-        if name == "Haar_Cascade":
-            print("  - Best for: Real-time applications with moderate accuracy requirements")
-        elif name == "HOG_SVM":
-            print("  - Best for: Applications requiring good balance of speed and accuracy")
-        elif name == "YOLOv5":
-            print("  - Best for: High accuracy requirements (if available)")
-        elif name == "Background_Subtraction":
-            print("  - Best for: Video surveillance with static background")
-
-# Print recommendations
-if 'report' in locals() and report:
-    print_recommendations(report)
-
-
-
-def analyze_detailed_results(all_results):
-    """Provide detailed analysis of detection results"""
+        for idx, image_path in enumerate(image_files):
+            print(f"Processing image {idx + 1}/{len(image_files)}: {image_path.name}")
+            image = cv2.imread(str(image_path))
+            
+            if image is None:
+                continue
+            
+            self.detection_results[image_path.name] = {}
+            
+            for model_name, detect_func in models.items():
+                detections, inference_time = detect_func(image)
+                
+                self.results[model_name].append({
+                    'image': image_path.name,
+                    'num_detections': len(detections),
+                    'inference_time': inference_time,
+                    'detections': detections
+                })
+                
+                self.detection_results[image_path.name][model_name] = {
+                    'detections': detections,
+                    'inference_time': inference_time
+                }
+            
+            # Save visualization for first 10 images
+            if idx < 10:
+                self.visualize_detections(image, image_path.name)
     
-    if not all_results:
-        print("No results to analyze")
+    def visualize_detections(self, image, image_name):
+        """Create visualization comparing all models"""
+        models = ['YOLOv5', 'YOLOv8', 'Haar Cascade', 'HOG', 'Ad-Hoc']
+
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        axes = axes.flatten()
+
+        # Original image
+        axes[0].imshow(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        axes[0].set_title('Original Image')
+        axes[0].axis('off')
+
+        for idx, model_name in enumerate(models, 1):
+            img_copy = image.copy()
+
+            if image_name in self.detection_results and model_name in self.detection_results[image_name]:
+                detections = self.detection_results[image_name][model_name]['detections']
+                inference_time = self.detection_results[image_name][model_name]['inference_time']
+
+                # Draw bounding boxes
+                for det in detections:
+                    x1, y1, x2, y2 = det['bbox']
+                    conf = det['confidence']
+                    cv2.rectangle(img_copy, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(img_copy, f"{conf:.2f}", (x1, y1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+                axes[idx].imshow(cv2.cvtColor(img_copy, cv2.COLOR_BGR2RGB))
+                axes[idx].set_title(f'{model_name}\n{len(detections)} detections | {inference_time*1000:.1f}ms')
+            else:
+                axes[idx].imshow(cv2.cvtColor(img_copy, cv2.COLOR_BGR2RGB))
+                axes[idx].set_title(f'{model_name}\nNot Available')
+
+            axes[idx].axis('off')
+
+        plt.tight_layout()
+        plt.savefig(self.output_dir / "visualizations" / f"comparison_{image_name}")
+        plt.close()
+    
+    def generate_performance_report(self):
+        """Generate comprehensive performance analysis"""
+        print("\nGenerating performance report...")
+        
+        # Calculate statistics
+        stats_data = []
+        for model_name, results in self.results.items():
+            if not results:
+                continue
+                
+            inference_times = [r['inference_time'] for r in results]
+            num_detections = [r['num_detections'] for r in results]
+            
+            stats_data.append({
+                'Model': model_name,
+                'Avg Inference Time (ms)': np.mean(inference_times) * 1000,
+                'Std Inference Time (ms)': np.std(inference_times) * 1000,
+                'Min Inference Time (ms)': np.min(inference_times) * 1000,
+                'Max Inference Time (ms)': np.max(inference_times) * 1000,
+                'Avg Detections': np.mean(num_detections),
+                'Total Detections': np.sum(num_detections),
+                'Images Processed': len(results)
+            })
+        
+        df_stats = pd.DataFrame(stats_data)
+        
+        # Save to CSV
+        df_stats.to_csv(self.output_dir / "performance_statistics.csv", index=False)
+        
+        # Print summary
+        print("\n" + "="*164)
+        print("PERFORMANCE SUMMARY")
+        print("="*164)
+        print(df_stats.to_string(index=False))
+        print("="*164)
+        
+        # Generate graphs
+        self.plot_inference_time_comparison(df_stats)
+        self.plot_detection_count_comparison(df_stats)
+        self.plot_inference_time_distribution()
+        self.plot_detection_heatmap()
+        
+        print(f"\n✓ Results saved to: {self.output_dir}")
+        print(f"  - Statistics: performance_statistics.csv")
+        print(f"  - Visualizations: visualizations/")
+        print(f"  - Graphs: graphs/")
+    
+    def plot_inference_time_comparison(self, df_stats):
+        """Plot inference time comparison"""
+        plt.figure(figsize=(12, 6))
+
+        # Left: Average inference time on a logarithmic (exponential) y-scale
+        ax1 = plt.subplot(1, 2, 1)
+        times = df_stats['Avg Inference Time (ms)'].astype(float).copy()
+        # Replace non-positive values with a small epsilon to allow log scaling
+        epsilon = 1e-3
+        times = times.where(times > 0, epsilon)
+
+        ax1.bar(df_stats['Model'], times, color='skyblue', edgecolor='navy')
+        ax1.set_xlabel('Model')
+        ax1.set_ylabel('Average Inference Time (ms) (log scale)')
+        ax1.set_title('Average Inference Time by Model (log scale)')
+        ax1.set_xticklabels(df_stats['Model'], rotation=45, ha='right')
+        ax1.set_yscale('log')
+        # Use base-10 log ticks for readability
+        ax1.yaxis.set_major_locator(ticker.LogLocator(base=10.0))
+        ax1.yaxis.set_minor_locator(ticker.LogLocator(base=10.0, subs='auto'))
+        ax1.grid(axis='y', alpha=0.3, which='both')
+
+        # Right: Average detections (linear)
+        ax2 = plt.subplot(1, 2, 2)
+        ax2.bar(df_stats['Model'], df_stats['Avg Detections'], color='lightcoral', edgecolor='darkred')
+        ax2.set_xlabel('Model')
+        ax2.set_ylabel('Average Number of Detections')
+        ax2.set_title('Average Detections per Image by Model')
+        ax2.set_xticklabels(df_stats['Model'], rotation=45, ha='right')
+        ax2.grid(axis='y', alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(self.output_dir / "graphs" / "inference_time_comparison.png", dpi=300)
+        plt.close()
+    
+    def plot_detection_count_comparison(self, df_stats):
+        """Plot detection count comparison"""
+        plt.figure(figsize=(10, 6))
+        
+        x = np.arange(len(df_stats))
+        width = 0.35
+        
+        fig, ax = plt.subplots(figsize=(12, 6))
+        bars1 = ax.bar(x - width/2, df_stats['Avg Detections'], width, 
+                       label='Avg Detections', color='lightgreen')
+        bars2 = ax.bar(x + width/2, df_stats['Total Detections']/10, width, 
+                       label='Total Detections (÷10)', color='orange')
+        
+        ax.set_xlabel('Model')
+        ax.set_ylabel('Count')
+        ax.set_title('Detection Count Comparison')
+        ax.set_xticks(x)
+        ax.set_xticklabels(df_stats['Model'], rotation=45, ha='right')
+        ax.legend()
+        ax.grid(axis='y', alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(self.output_dir / "graphs" / "detection_count_comparison.png", dpi=300)
+        plt.close()
+    
+    def plot_inference_time_distribution(self):
+        """Plot inference time distribution for all models"""
+        plt.figure(figsize=(14, 8))
+        
+        for model_name, results in self.results.items():
+            if not results:
+                continue
+            inference_times = [r['inference_time'] * 1000 for r in results]
+            plt.hist(inference_times, alpha=0.5, label=model_name, bins=20)
+        
+        plt.xlabel('Inference Time (ms)')
+        plt.ylabel('Frequency')
+        plt.title('Inference Time Distribution Across Models')
+        plt.legend()
+        plt.grid(alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(self.output_dir / "graphs" / "inference_time_distribution.png", dpi=300)
+        plt.close()
+    
+    def plot_detection_heatmap(self):
+        """Plot heatmap of detections per image"""
+        models = list(self.results.keys())
+        images = list(self.detection_results.keys())[:20]  # First 20 images
+        
+        if not models or not images:
+            return
+        
+        heatmap_data = []
+        for img in images:
+            row = []
+            for model in models:
+                if model in self.detection_results[img]:
+                    row.append(self.detection_results[img][model]['detections'].__len__())
+                else:
+                    row.append(0)
+            heatmap_data.append(row)
+        
+        plt.figure(figsize=(12, 10))
+        sns.heatmap(heatmap_data, xticklabels=models, 
+                   yticklabels=[img[:20] for img in images],
+                   annot=True, fmt='d', cmap='YlOrRd', cbar_kws={'label': 'Number of Detections'})
+        plt.xlabel('Model')
+        plt.ylabel('Image')
+        plt.title('Detection Heatmap (Detections per Image per Model)')
+        plt.tight_layout()
+        plt.savefig(self.output_dir / "graphs" / "detection_heatmap.png", dpi=300)
+        plt.close()
+
+def main():
+    # Configuration
+    DATASET_PATH = "human detection dataset/images"
+    YOLOV5_MODEL_PATH = "yolov5nu.pt"
+    
+    # Verify paths
+    if not os.path.exists(DATASET_PATH):
+        print(f"Error: Dataset path '{DATASET_PATH}' not found!")
         return
     
-    print("\n" + "="*60)
-    print("DETAILED RESULTS ANALYSIS")
-    print("="*60)
+    if not os.path.exists(YOLOV5_MODEL_PATH):
+        print(f"Error: YOLOv5 model '{YOLOV5_MODEL_PATH}' not found!")
+        return
     
-    # Count total detections per detector
-    total_detections = defaultdict(int)
-    total_images_with_detections = defaultdict(int)
+    # Run comparison
+    comparator = HumanDetectionComparison(DATASET_PATH, YOLOV5_MODEL_PATH)
+    comparator.process_dataset()
+    comparator.generate_performance_report()
     
-    for img_path, results in all_results.items():
-        for detector_name, result in results.items():
-            total_detections[detector_name] += result['detection_count']
-            if result['detection_count'] > 0:
-                total_images_with_detections[detector_name] += 1
-    
-    print(f"Total Images Processed: {len(all_results)}")
-    print("\nDetection Summary:")
-    print("-" * 50)
-    
-    for detector_name in detectors.keys():
-        if detector_name in total_detections:
-            avg_detections = total_detections[detector_name] / len(all_results)
-            detection_rate = (total_images_with_detections[detector_name] / len(all_results)) * 100
-            print(f"{detector_name:20} | Total: {total_detections[detector_name]:4} | "
-                  f"Avg: {avg_detections:5.2f} | Detection Rate: {detection_rate:5.1f}%")
+    print("\n✓ Analysis complete!")
 
-# Run detailed analysis
-if all_results:
-    analyze_detailed_results(all_results)
+if __name__ == "__main__":
+    main()
